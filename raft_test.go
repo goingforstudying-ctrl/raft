@@ -3098,6 +3098,113 @@ func TestRaft_InstallSnapshot_InvalidPeers(t *testing.T) {
 	require.Contains(t, resp.Error.Error(), "failed to decode peers")
 }
 
+// TestRaft_AppendEntries_ConcurrentTermBump exercises the race at the heart of
+// https://github.com/hashicorp/raft/issues/695: a heartbeat AppendEntries is
+// served on the transport I/O thread (the async fast-path) and can bump
+// currentTerm / flip the node to Follower at the same time the main thread is
+// doing its own appendEntries work. The check-and-set of (state, currentTerm)
+// must be serialized so concurrent callers can never observe an interleaved
+// intermediate state. We hammer the handler from many goroutines with mixed
+// terms and states and run it under -race; before the fix the unsynchronized
+// transition was a data race and could leave term/state inconsistent.
+func TestRaft_AppendEntries_ConcurrentTermBump(t *testing.T) {
+	_, transport := NewInmemTransport("")
+
+	// Fire a heartbeat-style appendEntries (no entries, higher term) from many
+	// goroutines at once, while the node is still marked Leader. Every caller
+	// must serialize the step-down transition.
+	conf := DefaultConfig()
+	conf.LocalID = "leader"
+	r := &Raft{
+		trans:  transport,
+		logger: hclog.New(nil),
+		logs:   NewInmemStore(),
+		stable: NewInmemStore(),
+	}
+	r.conf.Store(*conf)
+	r.setState(Leader)
+	r.setCurrentTerm(5)
+
+	header := RPCHeader{ProtocolVersion: ProtocolVersionMax, ID: []byte("leader")}
+
+	// Each goroutine applies a heartbeat with a distinct higher term and then
+	// immediately reads back (state, term). With an unsynchronized transition a
+	// caller can observe a torn state: currentTerm already bumped (by its own
+	// or a peer's write) while state still reads Leader, which is exactly the
+	// precondition that lets a superseded leader keep appending under a term it
+	// no longer holds. The mutex makes the step-down atomic, so no caller may
+	// ever observe state==Leader together with a term above the one it led.
+	torn := make(chan string, 32)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 32; i++ {
+		wg.Add(1)
+		go func(term uint64) {
+			defer wg.Done()
+			chResp := make(chan RPCResponse, 1)
+			rpc := RPC{
+				Command: &AppendEntriesRequest{
+					RPCHeader: header,
+					Term:      term,
+				},
+				RespChan: chResp,
+			}
+			r.appendEntries(rpc, rpc.Command.(*AppendEntriesRequest))
+			resp := <-chResp
+			require.NoError(t, resp.Error)
+
+			if r.getState() == Leader && r.getCurrentTerm() > 5 {
+				torn <- fmt.Sprintf("torn state: still Leader at term %d", r.getCurrentTerm())
+			}
+		}(uint64(6 + i))
+	}
+	wg.Wait()
+	close(torn)
+	for s := range torn {
+		t.Error(s)
+	}
+
+	// The node must have converged to Follower at the highest advertised term,
+	// never a torn mix of "still Leader" with a bumped term.
+	require.Equal(t, Follower, r.getState())
+	require.Equal(t, uint64(6+31), r.getCurrentTerm())
+}
+
+// TestRaft_DispatchLogs_AfterLeadershipLost verifies the defense-in-depth
+// guard in dispatchLogs: if a leader is asynchronously superseded (a heartbeat
+// from a higher-term leader flips it to Follower) before it can persist a
+// client entry, dispatchLogs must refuse to write the entry and answer the
+// future with ErrLeadershipLost instead of committing a divergent log entry
+// stamped with a term the node no longer leads.
+func TestRaft_DispatchLogs_AfterLeadershipLost(t *testing.T) {
+	_, transport := NewInmemTransport("")
+
+	r := &Raft{
+		trans:  transport,
+		logger: hclog.New(nil),
+		logs:   NewInmemStore(),
+		stable: NewInmemStore(),
+	}
+	r.setCurrentTerm(3)
+	// Node has already been flipped to Follower by a concurrent heartbeat that
+	// carried term 4, but a client apply that was queued while it was still
+	// leader is only being dispatched now.
+	r.setState(Follower)
+	r.setCurrentTerm(4)
+
+	future := &logFuture{log: Log{Type: LogCommand, Data: []byte("x")}}
+	future.init()
+
+	r.dispatchLogs([]*logFuture{future})
+
+	// The entry must not have been persisted and the future must be answered
+	// with ErrLeadershipLost so the caller can retry against the real leader.
+	require.ErrorIs(t, future.Error(), ErrLeadershipLost)
+	lastIdx, err := r.logs.LastIndex()
+	require.NoError(t, err)
+	require.Equal(t, uint64(0), lastIdx, "no log entry should be stored after leadership is lost")
+}
+
 func TestRaft_VoteNotGranted_WhenNodeNotInCluster(t *testing.T) {
 	// Make a cluster
 	c := MakeCluster(3, t, nil)

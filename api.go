@@ -140,6 +140,21 @@ type Raft struct {
 	// on.
 	candidateFromLeadershipTransfer atomic.Bool
 
+	// rpcTransitionLock serializes the "observe a higher term -> step down to
+	// follower" transition that can be triggered concurrently from two places:
+	// the main raft thread (via processRPC) and the transport I/O thread (via
+	// the async heartbeat fast-path, processHeartbeat). HashiCorp Raft handles
+	// heartbeat AppendEntries on the transport thread to keep the election
+	// timeout decoupled from disk latency, but a heartbeat carrying a newer
+	// term mutates currentTerm and state just like any other AppendEntries.
+	// Without serialization that mutation can interleave with the main thread
+	// in the middle of dispatching a log entry or handling another RPC, which
+	// is exactly the race that produces the data-divergence safety violation
+	// described in https://github.com/hashicorp/raft/issues/695. The lock makes
+	// the check-and-set of (state, currentTerm) atomic with respect to both
+	// callers so a node can never act on a term it has already superseded.
+	rpcTransitionLock sync.Mutex
+
 	// Stores our local server ID, used to avoid sending RPCs to ourself
 	localID ServerID
 

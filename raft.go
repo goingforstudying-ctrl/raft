@@ -1249,6 +1249,24 @@ func (r *Raft) dispatchLogs(applyLogs []*logFuture) {
 	term := r.getCurrentTerm()
 	lastIndex := r.getLastIndex()
 
+	// Guard against the async heartbeat race. A heartbeat AppendEntries is
+	// handled on the transport I/O thread and can bump currentTerm and flip
+	// this node to Follower concurrently with the leader loop. If that happens
+	// after we entered the leader path but before we persist the entry, we
+	// would write (and start replicating) a log entry stamped with a term we
+	// no longer lead, which is precisely the log-divergence safety violation
+	// from https://github.com/hashicorp/raft/issues/695. Re-read the state and
+	// refuse to dispatch if we have been superseded; the futures are answered
+	// with ErrLeadershipLost so callers can retry against the real leader.
+	if r.getState() != Leader {
+		r.logger.Warn("aborting log dispatch, leadership lost before append",
+			"term", term, "state", r.getState())
+		for _, applyLog := range applyLogs {
+			applyLog.respond(ErrLeadershipLost)
+		}
+		return
+	}
+
 	n := len(applyLogs)
 	logs := make([]*Log, n)
 	metrics.SetGauge([]string{"raft", "leader", "dispatchNumLogs"}, float32(n))
@@ -1476,13 +1494,24 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) {
 	}
 
 	// Increase the term if we see a newer one, also transition to follower
-	// if we ever get an appendEntries call
+	// if we ever get an appendEntries call.
+	//
+	// This check-and-set can run on the transport I/O thread (heartbeat
+	// fast-path) concurrently with the main raft thread, so it must be
+	// serialized with rpcTransitionLock. Otherwise a heartbeat that bumps the
+	// term can interleave with the main thread between its own term read and
+	// its next state mutation, letting the node keep acting (e.g. appending a
+	// log entry) under a term it has already superseded. Holding the lock for
+	// the whole decide-and-apply window guarantees the transition is observed
+	// atomically by every caller.
+	r.rpcTransitionLock.Lock()
 	if a.Term > r.getCurrentTerm() || (r.getState() != Follower && !r.candidateFromLeadershipTransfer.Load()) {
 		// Ensure transition to follower
 		r.setState(Follower)
 		r.setCurrentTerm(a.Term)
 		resp.Term = a.Term
 	}
+	r.rpcTransitionLock.Unlock()
 
 	// Save the current leader
 	if len(a.Addr) > 0 {
