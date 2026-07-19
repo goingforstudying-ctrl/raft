@@ -5,6 +5,7 @@ package raft
 
 import (
 	"bytes"
+	"container/list"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -3169,6 +3170,9 @@ func TestRaft_DispatchLogs_AfterLeadershipLost(t *testing.T) {
 	// Simulate: heartbeat bumped us to Follower at term 4 before dispatch ran.
 	r.setState(Follower)
 	r.setCurrentTerm(4)
+
+	// dispatchLogs expects leaderState.inflight to be initialized.
+	r.leaderState.inflight = list.New()
 
 	future := &logFuture{log: Log{Type: LogCommand, Data: []byte("x")}}
 	future.init()
