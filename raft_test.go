@@ -3173,6 +3173,8 @@ func TestRaft_DispatchLogs_AfterLeadershipLost(t *testing.T) {
 
 	// dispatchLogs expects leaderState.inflight to be initialized.
 	r.leaderState.inflight = list.New()
+	// dispatchLogs also touches leaderState.commitment after storing logs.
+	r.leaderState.commitment = newCommitment(make(chan struct{}), Configuration{}, 0)
 
 	future := &logFuture{log: Log{Type: LogCommand, Data: []byte("x")}}
 	future.init()
