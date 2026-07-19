@@ -1251,9 +1251,9 @@ func (r *Raft) dispatchLogs(applyLogs []*logFuture) {
 
 	// A heartbeat on the I/O thread can flip us to Follower mid-dispatch.
 	// Refuse to append under a term we no longer lead.
-	if r.getState() != Leader {
+	if r.getCurrentTerm() != term {
 		r.logger.Warn("aborting log dispatch, leadership lost before append",
-			"term", term, "state", r.getState())
+			"term", term, "currentTerm", r.getCurrentTerm())
 		for _, applyLog := range applyLogs {
 			applyLog.respond(ErrLeadershipLost)
 		}
