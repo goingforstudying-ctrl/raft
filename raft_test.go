@@ -1547,8 +1547,16 @@ func TestRaft_SnapshotRestore_PeerChange(t *testing.T) {
 	c2.fsms = append(c2.fsms, r.fsm.(*MockFSM))
 	c2.FullyConnect()
 
-	// Wait a while.
-	time.Sleep(c.propagateTimeout)
+	// Wait a while. Poll instead of a fixed sleep because the new
+	// rpcTransitionLock in appendEntries can add a small delay on loaded
+	// CI runners, making a fixed propagateTimeout flaky.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if r.getLastApplied() >= 103 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 
 	// Ensure we elect a leader, and that we replicate to our new followers.
 	c2.EnsureSame(t)
