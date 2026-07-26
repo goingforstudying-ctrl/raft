@@ -1979,6 +1979,13 @@ func (r *Raft) installSnapshot(rpc RPC, req *InstallSnapshotRequest) {
 				"local-term", snapEntry.Term,
 				"snapshot-term", req.LastLogTerm)
 		}
+		// The discarded suffix may have carried configuration changes past
+		// the snapshot's configuration index. Roll the in-memory latest
+		// configuration back so a later AppendEntries cannot re-apply a
+		// stale config entry on top of the snapshot baseline.
+		if r.configurations.latestIndex > reqConfigurationIndex {
+			r.setLatestConfiguration(reqConfiguration, reqConfigurationIndex)
+		}
 	}
 
 	// Clear old logs if r.logs is a MonotonicLogStore. Otherwise compact the
