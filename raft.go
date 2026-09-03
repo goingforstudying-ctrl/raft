@@ -331,8 +331,7 @@ func (r *Raft) runCandidate() {
 			// Check if the term is greater than ours, bail
 			if preVote.Term > term {
 				r.logger.Debug("pre-vote denied: found newer term, falling back to follower", "term", preVote.Term)
-				r.setState(Follower)
-				r.setCurrentTerm(preVote.Term)
+				r.transitionToFollower(preVote.Term)
 				return
 			}
 
@@ -366,8 +365,7 @@ func (r *Raft) runCandidate() {
 			// Check if the term is greater than ours, bail
 			if vote.Term > r.getCurrentTerm() {
 				r.logger.Debug("newer term discovered, fallback to follower", "term", vote.Term)
-				r.setState(Follower)
-				r.setCurrentTerm(vote.Term)
+				r.transitionToFollower(vote.Term)
 				return
 			}
 
@@ -1442,8 +1440,8 @@ func (r *Raft) processRPC(rpc RPC) {
 }
 
 // processHeartbeat is a special handler used just for heartbeat requests
-// so that they can be fast-pathed if a transport supports it. This must only
-// be called from the main thread.
+// so that they can be fast-pathed if a transport supports it. May be
+// called from the main thread or the transport I/O thread on the fast path.
 func (r *Raft) processHeartbeat(rpc RPC) {
 	defer metrics.MeasureSince([]string{"raft", "rpc", "processHeartbeat"}, time.Now())
 
@@ -1464,8 +1462,8 @@ func (r *Raft) processHeartbeat(rpc RPC) {
 	}
 }
 
-// appendEntries is invoked when we get an append entries RPC call. This must
-// only be called from the main thread.
+// appendEntries is invoked when we get an append entries RPC call. May be
+// called from the main thread or, for heartbeats, the transport I/O thread.
 func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) {
 	defer metrics.MeasureSince([]string{"raft", "rpc", "appendEntries"}, time.Now())
 	// Setup a response
@@ -1700,9 +1698,7 @@ func (r *Raft) requestVote(rpc RPC, req *RequestVoteRequest) {
 	if req.Term > r.getCurrentTerm() {
 		// Ensure transition to follower
 		r.logger.Debug("lost leadership because received a requestVote with a newer term")
-		r.setState(Follower)
-		r.setCurrentTerm(req.Term)
-
+		r.transitionToFollower(req.Term)
 		resp.Term = req.Term
 	}
 
@@ -1878,8 +1874,7 @@ func (r *Raft) installSnapshot(rpc RPC, req *InstallSnapshotRequest) {
 	// Increase the term if we see a newer one
 	if req.Term > r.getCurrentTerm() {
 		// Ensure transition to follower
-		r.setState(Follower)
-		r.setCurrentTerm(req.Term)
+		r.transitionToFollower(req.Term)
 		resp.Term = req.Term
 	}
 
@@ -2016,7 +2011,9 @@ func (r *Raft) electSelf() <-chan *voteResult {
 	// Increment the term
 	newTerm := r.getCurrentTerm() + 1
 
+	r.rpcTransitionLock.Lock()
 	r.setCurrentTerm(newTerm)
+	r.rpcTransitionLock.Unlock()
 	// Construct the request
 	lastIdx, lastTerm := r.getLastEntry()
 	req := &RequestVoteRequest{
@@ -2180,6 +2177,16 @@ func (r *Raft) setCurrentTerm(t uint64) {
 		panic(fmt.Errorf("failed to save current term: %v", err))
 	}
 	r.raftState.setCurrentTerm(t)
+}
+
+// transitionToFollower steps down to follower and adopts the given term. It
+// is serialized against the transport I/O thread, which may step the node
+// down concurrently via a fast-path heartbeat.
+func (r *Raft) transitionToFollower(term uint64) {
+	r.rpcTransitionLock.Lock()
+	defer r.rpcTransitionLock.Unlock()
+	r.setState(Follower)
+	r.setCurrentTerm(term)
 }
 
 // setState is used to update the current state. Any state
