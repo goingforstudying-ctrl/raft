@@ -2473,6 +2473,33 @@ func TestRaft_ProtocolVersion_Upgrade_1_2(t *testing.T) {
 		t.Fatalf("err: %v", future.Error())
 	}
 
+	// Wait until every node has applied the configuration change before
+	// checking for convergence. EnsureSamePeers already polls for up to
+	// longstopTimeout, but on slow 32-bit CI runners the new node's catch-up
+	// replication can exceed that window, so poll for the voter to appear
+	// everywhere first.
+	deadline := time.Now().Add(c.longstopTimeout)
+	for time.Now().Before(deadline) {
+		allPresent := true
+		for _, r := range c.rafts {
+			found := false
+			for _, srv := range c.getConfiguration(r).Servers {
+				if srv.ID == c1.rafts[0].localID {
+					found = true
+					break
+				}
+			}
+			if !found {
+				allPresent = false
+				break
+			}
+		}
+		if allPresent {
+			break
+		}
+		time.Sleep(c.conf.CommitTimeout)
+	}
+
 	// Sanity check the cluster.
 	c.EnsureSame(t)
 	c.EnsureSamePeers(t)
