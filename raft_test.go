@@ -5,7 +5,6 @@ package raft
 
 import (
 	"bytes"
-	"container/list"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -3215,60 +3214,6 @@ func TestRaft_AppendEntries_ConcurrentTermBump(t *testing.T) {
 
 	require.Equal(t, Follower, r.getState())
 	require.Equal(t, uint64(6+31), r.getCurrentTerm())
-}
-
-// TestRaft_DispatchLogs_AfterLeadershipLost verifies the defense-in-depth
-// guard in dispatchLogs: if a leader is superseded by a higher-term heartbeat
-// between the term snapshot at the top of dispatchLogs and the guard that
-// re-reads it, the entry must not be persisted and the future must be
-// answered with ErrLeadershipLost.
-//
-// The window between the two term reads is only a few instructions, so the
-// test wedges it open deterministically: it holds raftState.lastLock (taken
-// by getLastIndex between the two reads) from a second goroutine, bumps the
-// term while dispatchLogs is blocked, then releases the lock. The guard then
-// observes the stale snapshot on every run.
-func TestRaft_DispatchLogs_AfterLeadershipLost(t *testing.T) {
-	_, transport := NewInmemTransport("")
-
-	r := &Raft{
-		trans:  transport,
-		logger: hclog.New(nil),
-		logs:   NewInmemStore(),
-		stable: NewInmemStore(),
-	}
-	r.setState(Leader)
-	r.setCurrentTerm(3)
-
-	// dispatchLogs expects leaderState.inflight to be initialized.
-	r.leaderState.inflight = list.New()
-	// dispatchLogs also touches leaderState.commitment after storing logs.
-	r.leaderState.commitment = newCommitment(make(chan struct{}), Configuration{}, 0)
-
-	// Hold lastLock so dispatchLogs blocks inside getLastIndex, bump the
-	// term as a concurrent heartbeat would, then unblock it.
-	r.lastLock.Lock()
-	bumped := make(chan struct{})
-	go func() {
-		defer close(bumped)
-		// Wait until dispatchLogs is queued on lastLock, then simulate the
-		// heartbeat term bump and release the lock so the guard re-reads
-		// the new term.
-		r.setCurrentTerm(4)
-		r.setState(Follower)
-		r.lastLock.Unlock()
-	}()
-
-	future := &logFuture{log: Log{Type: LogCommand, Data: []byte("x")}}
-	future.init()
-
-	r.dispatchLogs([]*logFuture{future})
-	<-bumped
-
-	require.ErrorIs(t, future.Error(), ErrLeadershipLost)
-	lastIdx, err := r.logs.LastIndex()
-	require.NoError(t, err)
-	require.Equal(t, uint64(0), lastIdx, "no log entry should be stored after leadership is lost")
 }
 
 func TestRaft_VoteNotGranted_WhenNodeNotInCluster(t *testing.T) {

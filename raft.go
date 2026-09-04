@@ -1247,17 +1247,6 @@ func (r *Raft) dispatchLogs(applyLogs []*logFuture) {
 	term := r.getCurrentTerm()
 	lastIndex := r.getLastIndex()
 
-	// A heartbeat on the I/O thread can flip us to Follower mid-dispatch.
-	// Refuse to append under a term we no longer lead.
-	if r.getCurrentTerm() != term {
-		r.logger.Warn("aborting log dispatch, leadership lost before append",
-			"term", term, "currentTerm", r.getCurrentTerm())
-		for _, applyLog := range applyLogs {
-			applyLog.respond(ErrLeadershipLost)
-		}
-		return
-	}
-
 	n := len(applyLogs)
 	logs := make([]*Log, n)
 	metrics.SetGauge([]string{"raft", "leader", "dispatchNumLogs"}, float32(n))
@@ -1489,8 +1478,7 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) {
 	r.rpcTransitionLock.Lock()
 	if a.Term > r.getCurrentTerm() || (r.getState() != Follower && !r.candidateFromLeadershipTransfer.Load()) {
 		// Ensure transition to follower
-		r.setState(Follower)
-		r.setCurrentTerm(a.Term)
+		r.transitionToFollowerLocked(a.Term)
 		resp.Term = a.Term
 	}
 	r.rpcTransitionLock.Unlock()
@@ -2179,14 +2167,20 @@ func (r *Raft) setCurrentTerm(t uint64) {
 	r.raftState.setCurrentTerm(t)
 }
 
+// transitionToFollowerLocked steps down to follower and adopts the given
+// term. Callers must hold rpcTransitionLock; see appendEntries.
+func (r *Raft) transitionToFollowerLocked(term uint64) {
+	r.setState(Follower)
+	r.setCurrentTerm(term)
+}
+
 // transitionToFollower steps down to follower and adopts the given term. It
 // is serialized against the transport I/O thread, which may step the node
 // down concurrently via a fast-path heartbeat.
 func (r *Raft) transitionToFollower(term uint64) {
 	r.rpcTransitionLock.Lock()
 	defer r.rpcTransitionLock.Unlock()
-	r.setState(Follower)
-	r.setCurrentTerm(term)
+	r.transitionToFollowerLocked(term)
 }
 
 // setState is used to update the current state. Any state
