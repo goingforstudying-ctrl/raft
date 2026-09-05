@@ -281,6 +281,35 @@ func TestRaft_HasExistingState(t *testing.T) {
 	// Check the FSMs.
 	c.EnsureSame(t)
 
+	// Wait until every node sees the new voter before checking peer
+	// convergence. EnsureSamePeers snapshots the first node's
+	// configuration up front, so if the AddVoter change commits after
+	// that snapshot the check can never match and fails after its
+	// polling window. On slow 32-bit CI runners the change has been
+	// observed to land that late, so poll for the voter to appear
+	// everywhere first.
+	deadline := time.Now().Add(c.longstopTimeout)
+	for time.Now().Before(deadline) {
+		allPresent := true
+		for _, r := range c.rafts {
+			found := false
+			for _, srv := range c.getConfiguration(r).Servers {
+				if srv.ID == c1.rafts[0].localID {
+					found = true
+					break
+				}
+			}
+			if !found {
+				allPresent = false
+				break
+			}
+		}
+		if allPresent {
+			break
+		}
+		time.Sleep(c.conf.CommitTimeout)
+	}
+
 	// Check the peers.
 	c.EnsureSamePeers(t)
 
